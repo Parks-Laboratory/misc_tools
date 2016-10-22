@@ -1,0 +1,966 @@
+---
+title: "Gene Query: `r params$gene_name`"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: pdf_document
+params: 
+  gene_name: x
+  tissues: c("Adipose", "Liver")
+  select_top: 1000
+  opt_output_all_cor_tables: FALSE
+---
+
+```{r, echo = FALSE, eval = FALSE}
+# Markdown Report to Query Experimental Details from Lab Database
+# Date: April 2 2016
+# Author: Jenny Nguyen
+# Email: jnnguyen2@wisc.edu
+
+# Markdown Report to Query Experimental Details from Lab Database
+
+# Function:
+# 1) Correlations: intersects top genes that are highly correlated (bicorrelation) to gene of interest across genders and diet within a tissue set; also intersects across mouse and human if adipose is specified
+# 2) Transcript Abundance: plots the RNA Expression of gene of interest in different tissues for different diets and genders
+# 3) eQTL: obtains SNPS that are highly correlated (pvalue < 1e-05) with gene of interest
+      # Plots SNP location by chromosome
+      # Prints name of and location of select number of SNPs 
+
+# Parameters:
+  # gene_name: (string) gene of interest
+  # select_top: (integer) select top n genes that are highly correlated to gene of interest (ranked by pvalue); top genes from intersected for each tissue group
+  # tissues: (vector) tissues of interest
+  # opt_output_all_cor_tables: (boolean) whether to output csv's of genes that are highly correlated with gene of interest (ordered by pvalue) in all tissues
+
+# Returns: PDF report
+```
+
+```{r global opts, echo = FALSE, message = FALSE}
+# knitr print options
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+# load libraries
+library(knitr)
+library(stringr)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(data.table)
+library(RODBC)
+library(ggplot2)
+library(xlsx)
+
+theme_set(theme_bw())
+
+# convert list of tissues into queryable phrase
+sql_tbl_pattern <- paste(str_to_title(params$tissues), collapse = "|")
+present_col <- 7
+```
+
+# Comparing trx vs. trx in `r str_replace(sql_tbl_pattern, "\\|", ", ")`
+
+```{r Obtain All Table Names in DB}
+
+# Connect to Database
+#----------------------------------------------------------------------------------------------------------------------
+ch <- odbcDriverConnect('SERVER=JLUSISDB;DATABASE=HMDP;Trusted_Connection=Yes;DRIVER={SQL Server Native Client 10.0}')
+  
+
+# Search sql database for all the table names
+all_db <- sqlTables(ch)
+
+
+# Close Database Connection
+#----------------------------------------------------------------------------------------------------------------------
+odbcClose(ch) 
+
+```
+
+```{r Obtain Specific Table Names for DB Query}
+
+# function grab the specified body tissues and the table names, generate separate tissue column (for db query loop later)
+# Parameters: subset of all_db which contains all of the table schem to grab from 
+subset_to_tissue <- function(x) {
+  return_x <- x %>% 
+    dplyr::select(TABLE_SCHEM, TABLE_NAME) %>% 
+    subset( str_detect(TABLE_NAME, "Chow|HighFat") & str_detect(TABLE_NAME, sql_tbl_pattern) ) %>% 
+    mutate(
+      tissue = str_replace(TABLE_NAME, "(Chow|HighFat)([a-zA-Z]+)_*.*", "\\2"), 
+      tissue = str_replace(tissue, "Male|Female", "")
+    ) %>% 
+    arrange(tissue, TABLE_NAME) 
+  
+  return(return_x)
+}
+
+# function to make sure that the outcoming tisues are actually the ones specified
+tissue_check <- function(x) subset(x, tissue %in% params$tissues)
+
+
+# Obtain Correlation Table Names to Query From
+#----------------------------------------------------------------------------------------------------------------------
+
+# subset to tables that are correlations of trx v specified substance
+cor_tables_of_interest <- all_db %>% 
+  subset(TABLE_SCHEM == "Correlations") %>% 
+  subset( str_detect(TABLE_NAME, paste0("_trx_", "trx", "_AllInfo")) )
+
+# grab the specified body tissues and the table names, generate separate tissue column (for db query loop later)
+cor_tables_of_interest <- subset_to_tissue(cor_tables_of_interest)
+cor_tables_of_interest <- tissue_check(cor_tables_of_interest)
+
+
+# Obtain All Correlation Table Names to Query From
+#----------------------------------------------------------------------------------------------------------------------
+
+# subset to tables that are correlations of chow or highfat tissues and of trx v trx
+all_cor_tabs <- all_db %>% 
+  subset(TABLE_SCHEM == "Correlations") %>% 
+  subset( str_detect(TABLE_NAME, "Chow|HighFat") & str_detect(TABLE_NAME, paste0("_trx_trx_AllInfo")) )
+
+# correlation tables of all tissues: to output as csvs
+all_cor_tabs <- all_cor_tabs %>% 
+  dplyr::select(TABLE_SCHEM, TABLE_NAME) %>% 
+  mutate(
+    tissue = str_replace(TABLE_NAME, "(Chow|HighFat)([a-zA-Z]+)_.*", "\\2"), 
+    tissue = str_replace(tissue, "Male|Female", "")
+  ) %>% 
+  arrange(tissue, TABLE_NAME)
+
+
+# Obtain Transcript Abundance Table Names to Query From
+#----------------------------------------------------------------------------------------------------------------------
+# subset to tables that are transcript abundances 
+transcript_abundance_tables_of_interest <- all_db %>% 
+  subset(TABLE_SCHEM == "TranscriptAbundance") %>% 
+  subset( str_detect(TABLE_NAME, "_avg") )
+
+# grab the specified body tissues and the table names, generate separate tissue column (for db query loop later)
+transcript_abundance_tables_of_interest <- subset_to_tissue(transcript_abundance_tables_of_interest)
+transcript_abundance_tables_of_interest <- tissue_check(transcript_abundance_tables_of_interest)
+
+  
+# Obtain Expression QTL Table Names to Query From
+#----------------------------------------------------------------------------------------------------------------------
+
+# subset to the tables that are expression QTLs
+eQTL_tables_of_interest <- all_db %>% 
+  subset(TABLE_SCHEM == "expressionQTL") %>% 
+  subset( str_detect(TABLE_NAME, "AllInfo") & !str_detect(TABLE_NAME, "elta")) 
+
+# grab the specified body tissues and the table names, generate separate tissue column (for db query loop later)
+eQTL_tables_of_interest <- subset_to_tissue(eQTL_tables_of_interest)
+
+# remove the "AllInfo" from the tissue name 
+eQTL_tables_of_interest <- mutate(eQTL_tables_of_interest, tissue = str_replace(tissue, "AllInfo", ""))
+
+# tissue check
+eQTL_tables_of_interest <- tissue_check(eQTL_tables_of_interest)
+```
+
+```{r Function to Open Tables from DB}
+
+# Generic preprocessing function (no preprocessing)
+no_process <- function(x) x
+
+#' Function to open tables for a specific function (correlations, transcript abundance, etc)
+
+#' Parameters:
+  #' tables of interest: data frame with TABLE_SCHEM, TABLE_NAME, and tissue columns. Tells the function which tables in the database to query from
+  #' sql_filter: the sql query selects all columns and subsets to the gene symbol; all other filtering can be provided in this variable
+  #' process_func: a function that conducts some pre-processing of the data prior to output (rename columns, etc); may be function specific; default is no processing
+  
+#' Returns:
+  #' a list of tables, the first "nesting" are the various tissues, the second "nesting" are the subsets (chow, high fat, male/female, etc)
+
+open_db <- function(tables_of_interest, sql_filter = "", process_func = no_process){
+  
+  # Connect to Database
+  #----------------------------------------------------------------------------------------------------------------------
+  ch <- odbcDriverConnect('SERVER=JLUSISDB;DATABASE=HMDP;Trusted_Connection=Yes;DRIVER={SQL Server Native Client 10.0}')
+
+  # Loop Through Table Options and Open Tables
+  #----------------------------------------------------------------------------------------------------------------------
+  
+  # Loop Parameters: separate tissues
+  loop_params <- unique(tables_of_interest$tissue)
+    
+  # function for each section
+  open <- function(x){
+    # query
+    generic_query <- paste0("select * ", "\n",
+                            "from ", x$TABLE_SCHEM, ".", x$TABLE_NAME, "\n",
+                            "where gene_symbol = \'", params$gene_name, "\'", "\n",
+                            sql_filter
+                            )
+    
+    # inner loop to open query db for the specified tissue tables
+    tbl_diet_tissue <- llply(generic_query, function(q) sqlQuery(ch, q))
+    names(tbl_diet_tissue) <- str_extract(x$TABLE_NAME, "[a-zA-Z]+")
+  
+    # specific pre-processing for the table
+    tbl_diet_tissue <- process_func(tbl_diet_tissue)
+    
+    # return the sql query results
+    return(tbl_diet_tissue)
+  }
+  
+  # open tables as a grouped data frame
+  all_tables <- tables_of_interest %>% 
+    group_by(tissue) %>% 
+    do(all_tables = open(.))
+    
+  # Close Database Connection
+  #----------------------------------------------------------------------------------------------------------------------
+  odbcClose(ch) 
+  
+  # returns the opened tables
+  return(all_tables)
+}
+
+```
+
+
+
+
+# Correlations
+
+```{r Output All COR Open DB Correlation Tables as CSV}
+
+if(params$opt_output_all_cor_tables){
+  
+  # Open All the Correlation Tables 
+  #----------------------------------------------------------------------------------------------------------------------
+  
+  # sql filter to order by the pvalue
+  sql_filter <- "order by pvalue"
+  
+  # subset to data less than 0.05
+  all_cor_preprocess <- function(y){
+    out_y <- llply(y, function(x){
+      out_x <- x %>% 
+        subset(pvalue <= 0.05) %>% 
+        dplyr::select(gene_symbol, matches("gene_title"), gene_symbol_2, matches("gene_title_2"), bicor, pvalue)
+      
+      if("gene_title_2" %in% colnames(out_x)) out_x <- dplyr::select(out_x, gene_symbol, gene_title, gene_symbol_2, gene_title_2, everything())
+      
+      return(out_x)
+    })
+  } 
+  
+  # open correlation tables by pvalue
+  all_tissue_cor <- open_db(all_cor_tabs, sql_filter = sql_filter, process_func = all_cor_preprocess)
+  tissue_names <- all_tissue_cor$tissue
+  all_tissue_cor <- all_tissue_cor$all_tables
+  names(all_tissue_cor) <- tissue_names
+  
+  # manually edit names of the macrophage
+  
+  macrophage_new_names <- all_cor_tabs %>% 
+    subset(tissue == "Macrophage") %>% 
+    mutate(TABLE_NAME = str_replace(TABLE_NAME, "_trx.*", "")) %>% 
+    .$TABLE_NAME
+  
+  names(all_tissue_cor$Macrophage) <- macrophage_new_names
+  
+  
+  # Output the CSVs for all Tissues
+  #----------------------------------------------------------------------------------------------------------------------
+
+  # create the file/folder to save the csvs
+  file_path <- paste0("M:/R/database_to_pdf/output/", params$gene_name, "_correlation_csvs/")
+  dir.create(file_path)
+  
+  # loop through the tissues and writes data to an excel file
+  uniq_tissues <- unique(all_cor_tabs$tissue)
+  l_ply(uniq_tissues, function(x){
+    
+    # grab the tissue set
+    current_tissue_set <- all_tissue_cor[[x]]
+    
+    # create the file names
+    file_name <- paste0(file_path, x, ".xlsx")
+    
+    # for each table in the tissue set, write to a excel sheet in the file
+    for(i in 1:length(current_tissue_set)){
+      
+      # save big (> 20,000) as csvs
+      if( nrow(current_tissue_set[[i]]) > 20000 ){
+        
+        # new file name for csv
+        new_file_name <- str_replace(file_name, ".xlsx", paste0(names(current_tissue_set)[i], ".csv"))
+        write.csv(current_tissue_set[[i]], str_replace(file_name, ".xlsx", ".csv"))
+        
+      } else {
+        
+        # write to excel with multiple sheets
+        write.xlsx(current_tissue_set[[i]], 
+          file = file_name, sheetName = names(current_tissue_set)[i], 
+          append = (i != 1), row.names = FALSE)
+        
+      }
+  
+    }
+  })
+  
+}
+
+```
+
+
+
+```{r COR Human Adpiose Open DB Correlation Tables}
+
+if(str_detect(sql_tbl_pattern, "Adipose")){
+  
+  # Connect to Database
+  #----------------------------------------------------------------------------------------------------------------------
+  ch <- odbcDriverConnect('SERVER=JLUSISDB;DATABASE=Human;Trusted_Connection=Yes;DRIVER={SQL Server Native Client 10.0}')
+    
+  
+  # Search sql database for all the table names
+  all_db_human <- sqlTables(ch)
+  
+  # Subset to the table name for human adpiose tissue
+  cor_tab_of_interest_human <- all_db_human %>% 
+    subset(TABLE_SCHEM == "Correlations") %>% 
+    subset( str_detect(TABLE_NAME, "trx_trx_AllInfo") ) %>% 
+    dplyr::select(TABLE_SCHEM, TABLE_NAME) %>% 
+    mutate(tissue = "Adipose")
+  
+  # Open the human adipose data, select gene name, order by pvalue
+  generic_query <- paste0("select *", "\n",
+                            "from ", cor_tab_of_interest_human$TABLE_SCHEM, ".", cor_tab_of_interest_human$TABLE_NAME, "\n",
+                            "where gene_symbol_1 = \'", params$gene_name, "\'", "\n",
+                            "order by pvalue"
+                          )
+  human_adipose_correlations <- sqlQuery(ch, generic_query)
+  
+  # select and rename columns
+  human_adipose_correlations <- dplyr::select(human_adipose_correlations, gene_symbol_1, gene_symbol_2, bicor, pvalue)
+  colnames(human_adipose_correlations)[1:2] <- c("gene_symbol", "correlated_with")
+  human_adipose_correlations <- slice(human_adipose_correlations, 1:params$select_top)
+  
+  
+  # Close Database Connection
+  #----------------------------------------------------------------------------------------------------------------------
+  odbcClose(ch)  
+
+}
+
+```
+
+```{r COR Open DB Correlation Tables}
+
+# Open the Correlation Tables for the Intersections
+#----------------------------------------------------------------------------------------------------------------------
+
+# sql filter to order by the pvalue
+sql_filter <- "order by pvalue"
+
+# pre-processing function for correlations
+cor_preprocess <- function(y){
+  
+  # since we can obtain correlations from genes to any other set (genes, metabolites, protein, clinical), 
+  # need to extract correct other object and rename it accordingly
+  
+  # other object is in second column
+  tbl_diet_tissue <- llply(y, function(x) dplyr::select(x, gene_symbol, matches("symbol|name"), bicor, pvalue))
+  
+  # take second column and rename it correlated with
+  tbl_diet_tissue <- llply(tbl_diet_tissue, function(x){
+    colnames(x)[2] <- "correlated_with"
+    return(x)
+  })
+  
+  # return after done preprocessing
+  return(tbl_diet_tissue)
+  
+}
+
+# open the correlation tables
+all_correlations <- open_db(cor_tables_of_interest, sql_filter = sql_filter, process_func = cor_preprocess)
+
+```
+
+```{r COR Intersections within Tissues}
+
+# Intersections by Tissue
+#----------------------------------------------------------------------------------------------------------------------
+
+# Function to find intersections between all highly correlated genes with the given gene
+  # Parameters: tissue_set, a list of data frames corresponding to one tissue
+  # returns a data frame, where all the variants (chow, highfat, etc) are merged together
+
+intersect_mouse <- function(tissue_set){
+  # select top 1000 from each table
+  tbl <- llply(tissue_set, function(x) slice(x, 1:params$select_top))
+      
+  # find intersections/(3way inner merges) between all highly correlated genes with given gene
+  set_intersect <- llply(tbl, function(x) distinct(dplyr::select(x, gene_symbol, correlated_with, bicor)))
+  set_intersect <- Reduce(function(x, y) merge(x, y, by = c("gene_symbol", "correlated_with")), set_intersect)
+  
+  # obtain bicor information from the intersections, rename so that bicor info also contains tissue set info
+  intersect_and_bicor <- dplyr::select(set_intersect, gene_symbol, correlated_with, matches("bicor"))
+  colnames(intersect_and_bicor)[3:ncol(intersect_and_bicor)] <- paste0("bicor_", names(tissue_set) )
+  
+  # return intersection results
+  return(intersect_and_bicor)
+}
+
+# Functions to obtain intersection tables
+  # Parameters: x, a list of tissue data frames with column names gene_symbol, correlated_with, bicor_("additional descriptor")
+  # Returns: list of tissue objects formatted for the specific presentation purpose
+
+# function to present intersections
+find_intersections <- function(x){
+  
+  # extract names of the correlated genes
+  return_obj <- llply(x, function(set_intersect){
+  
+    # convert the top genes into a matrix format for condensed printing 
+    set_intersect <- unique(as.character(set_intersect$correlated_with))
+    how_many_spaces <- present_col - (length(set_intersect) %% present_col)
+    set_intersect <- matrix(c(set_intersect, rep("", how_many_spaces)), byrow = TRUE, ncol = present_col)
+  
+    # return intersection
+    return(set_intersect)
+    
+  })
+  
+  # return results
+  return(return_obj)
+}
+
+# function to present intersections with bicor
+find_intersections_with_bicor <- function(x) {
+    
+    # extract intersections along with bicor information for x
+    return_obj <- llply(x, function(intersect_and_bicor){
+    
+      # remove the gene symbol column
+      intersect_and_bicor <- dplyr::select(intersect_and_bicor, correlated_with, matches("bicor"))
+      
+      # function to reformat the merged data
+      edit_repeats <- function(y){
+    
+        # find the unique bicorrelations
+        unique_vals <- llply( 2:ncol(y), function(col) unique(unlist(y[, col])) )
+        names(unique_vals) <- colnames(y)[2:ncol(y)]
+    
+        # find the number of rows we need to fill
+        num_rep <- max( laply(unique_vals, length) )
+    
+        # for those who do not fall within the number of rows, add NA to end
+        new_data <- llply(unique_vals, function(col) c(col, rep(NA, num_rep - length(col))) )
+        
+        # add in the object correlated with
+        new_data[["correlated_with"]] <- unique(y$correlated_with)
+        
+        # make it into a data frame
+        new_data <- as.data.frame(new_data, stringsAsFactors = FALSE)
+        new_data <- dplyr::select(new_data, correlated_with, everything())
+        
+        # return 
+        return(new_data)
+      }
+      
+      # reformat the merged data (avoid duplicating the values due to the merge)
+      intersect_and_bicor <- intersect_and_bicor %>% 
+        group_by(correlated_with) %>% 
+        do(edit_repeats(.))
+      
+      return(intersect_and_bicor)
+    })
+  
+  # return results
+  return(return_obj)
+}
+
+
+# Intersections by Tissue for Mouse Strains
+#----------------------------------------------------------------------------------------------------------------------
+
+# find intersections in mouse by tissue
+all_correlations$intersections_by_tissue_mouse <- with(all_correlations, llply(all_tables, intersect_mouse))
+
+# obtain the intersections 
+all_correlations <- all_correlations %>% 
+  group_by(tissue) %>% 
+  mutate(
+    set_intersect_by_tissue = find_intersections(intersections_by_tissue_mouse),
+    set_intersect_with_bicor = find_intersections_with_bicor(intersections_by_tissue_mouse)
+  )
+
+
+# Intersections by Tissue (Adipose) for Mouse and Human
+#----------------------------------------------------------------------------------------------------------------------
+
+# extract intersection outputs from mouse + human
+if(str_detect(sql_tbl_pattern, "Adipose")){
+  
+  # convert the merge names to lower case so merge works
+  mouse_adipose_lower <- all_correlations %>% subset(tissue == "Adipose", intersections_by_tissue_mouse) %>% unnest
+  mouse_adipose_lower <- mutate(mouse_adipose_lower, gene_symbol = tolower(gene_symbol), correlated_with = tolower(correlated_with))
+  human_adipose_lower <- mutate(human_adipose_correlations, gene_symbol = tolower(gene_symbol), correlated_with = tolower(correlated_with))
+  
+  # intersect mouse and human adipose tissue
+  intersections_by_tissue_mouse_human <- merge(mouse_adipose_lower, human_adipose_lower, by = c("gene_symbol", "correlated_with")) 
+  
+  # formatting to rename the human bicor column and remove the pvalue column
+  intersections_by_tissue_mouse_human <- intersections_by_tissue_mouse_human %>% 
+    mutate(bicor_Human = bicor) %>% 
+    dplyr::select(-bicor, -pvalue)
+  
+  # put merge object into a list to conform to function standards
+  intersections_by_tissue_mouse_human <- list(Adipose = intersections_by_tissue_mouse_human)
+
+  # formatting for tissue intersections - returns NULL if there are no data to work with
+  intersect_with_human_adipose <- tryNULL( find_intersections(intersections_by_tissue_mouse_human) )
+  intersect_bicor_with_human_adipose <- tryNULL( find_intersections_with_bicor(intersections_by_tissue_mouse_human) )
+}
+
+```
+
+## Top `r params$select_top` Records 
+
+## Within Tissue Intersections
+```{r COR Output Within Tissue Intersections, results='asis'}
+
+# Output the tissue interaction tables
+#----------------------------------------------------------------------------------------------------------------------
+
+# Loop to print out the intersections within a tissue
+for(i in 1:nrow(all_correlations)){
+  
+  # print the tissue name
+  cat('### ', all_correlations$tissue[i])
+  cat('\n')
+  
+  # print the table
+  all_correlations$set_intersect_by_tissue[[i]] %>% kable(format = "markdown", col.names = rep("", present_col)) %>% print
+  
+  # make a new line
+  cat('\n')
+}
+```
+
+## Within Tissue Intersections with Bicorrelations
+```{r COR Output Within Tissue Intersections with Bicor, results='asis'}
+
+# Output tissues intersections with bicor information
+#----------------------------------------------------------------------------------------------------------------------
+
+# Loop to print out the intersections within a tissue
+for(i in 1:nrow(all_correlations)){
+  
+  # print the tissue name
+  cat('### ', all_correlations$tissue[i])
+  cat('\n')
+  
+  # print the table
+  all_correlations$set_intersect_with_bicor[[i]] %>% kable(format = "markdown") %>% print
+  
+  # make a new line
+  cat('\n')
+}
+```
+
+
+
+```{r COR Output Within Tissue Intersections with Human Adipose, results = 'asis'}
+
+if(str_detect(sql_tbl_pattern, "Adipose")){
+  
+  cat('## Adipose Intersections with Mouse and Human Data')
+  cat('\n')
+  
+  if(nrow(intersections_by_tissue_mouse_human$Adipose) > 0){
+    
+    # print out tissue intersections
+    cat('### Within Tissue Intersections')
+    cat('\n')
+    intersect_with_human_adipose$Adipose %>% kable(format = "markdown", col.names = rep("", present_col)) %>% print
+    cat('\n')
+    
+    # print out intersections with bicorrelations
+    cat("### Within Tissue Intersections with Bicorrelations")
+    cat('\n')
+    intersect_bicor_with_human_adipose$Adipose %>% kable(format = "markdown") %>% print
+    cat('\n')
+    
+  } else{
+    
+    # if there was no genes found in both human and mouse print message
+    cat("There where no intersecting genes")
+    cat('\n')
+
+  }
+}
+
+```
+
+
+
+
+# Transcript Abundance
+```{r TA Open DB Transcript Abundance Tables}
+
+# Open the Correlation Tables for the Transcript Abundances
+#----------------------------------------------------------------------------------------------------------------------
+
+# pre-processing function for transcript abundances
+ta_preprocess <- function(y) {
+  
+  # loop through potential subsets
+  tbl_diet_tissue <- llply(1:length(y), function(i) {
+    
+    # extract data frame from the list
+    x <- y[[i]]
+    
+    # remove the probeset id and the gene symbol
+    strains <- dplyr::select(x, -probesetID, -gene_symbol)
+    
+    # transpose variants long and rename column name to abundance
+    strains <- data.frame(t.data.frame(strains))
+    
+    # if there are more than 1 column: multiple probesets with the same gene add a col # after abundance
+    no.col <- rep(ncol(strains), ncol(strains))
+    colnames(strains) <- ifelse(no.col == 1, "abundance", paste0("abundance", 1:ncol(strains)))
+
+    # add a column describing the strains
+    strains <- mutate(strains, strain = rownames(strains))
+    
+    # if there are more than 1 abundance column, make another column called probeset
+    if(ncol(strains) > 2){
+      strains <- melt(strains, id.vars = "strain") 
+      
+      strains <- strains %>% 
+        mutate(
+          probeset = str_replace(variable, "abundance", "probeset #"),
+          abundance = value
+        ) %>% 
+        dplyr::select(-variable, -value)
+    }
+    
+    # add a column description of the dataframe
+    strains <- mutate(strains, diet_tissue = names(y)[[i]])
+
+    # return results
+    return(strains)
+  })
+  names(tbl_diet_tissue) <- names(y)
+  
+  # return results
+  return(tbl_diet_tissue)
+}
+
+# open the transcript abundance tables
+all_transcript_abundances <- open_db(transcript_abundance_tables_of_interest, process_func = ta_preprocess)
+
+```
+
+```{r TA Combine within Tissues}
+
+# Combine the tables
+#----------------------------------------------------------------------------------------------------------------------
+
+# combine the data from the tissues
+all_transcript_abundances$set_combined_tissues <- with(all_transcript_abundances, llply(all_tables, rbindlist))
+
+```
+
+## Within Tissue Plots
+```{r TA Output Plots of Transcript Abundances by Strain, results='asis'}
+
+# Output the graphs of transcript abundances in tissues
+#----------------------------------------------------------------------------------------------------------------------
+
+# Loop to print out the transcript abundances within a tissue
+for(i in 1:nrow(all_transcript_abundances)){
+  
+  # print the tissue name
+  cat('### ', all_transcript_abundances$tissue[i])
+  cat('\n')
+  
+  # generate a new var for ordering chow for plots: subset to chow and create var that is order by abundance 
+  if("probeset" %in% colnames(all_transcript_abundances$set_combined_tissues[[i]])){
+    # function to match probe 1 or 2
+    match_order <- function(p){
+      r <- all_transcript_abundances$set_combined_tissues[[i]] %>% 
+        subset(str_detect(diet_tissue, "Chow") & str_detect(probeset, p)) %>% 
+        arrange(abundance) %>% 
+        dplyr::mutate(order = 1:nrow(.)) %>% 
+        dplyr::select(strain, probeset, order)
+      return(r)
+    }
+    
+    # extract orders for all probesets
+    match_data <- lapply(unique(str_extract(all_transcript_abundances$set_combined_tissues[[i]]$probeset, "\\d+")), match_order) %>% 
+      rbindlist
+    
+    # set options for merge back to original data
+    merge_by <- c("strain", "probeset")
+
+    
+  } else{
+    # extract orders
+    match_data <- all_transcript_abundances$set_combined_tissues[[i]] %>% 
+      subset(str_detect(diet_tissue, "Chow")) %>% 
+      arrange(abundance) %>% 
+      dplyr::mutate(order = 1:nrow(.)) %>% 
+      dplyr::select(strain, order)
+    
+    # set options for merge back to original data
+    merge_by <- "strain"
+    
+  }  
+  
+  # merge the data with the data ordered by chow for plotting  
+  plot_data <- merge(all_transcript_abundances$set_combined_tissues[[i]], match_data, merge_by, all.x = TRUE)
+  
+  # plot the transcript abundances by strain
+  g <- ggplot(data = plot_data, aes(order, abundance, color = diet_tissue)) +
+    geom_point(alpha = 0.8) +
+    scale_x_continuous(breaks = NULL) +
+    scale_y_continuous(breaks = seq(2, 13, 2), limits = c(2, 13)) +
+    labs(x = "Strain", y = "Gene Expression (RNA)", color = "Diet and Tissue") +
+    ggtitle(paste0(all_transcript_abundances$tissue[i], " Tissue")) +
+    theme(legend.position = "bottom")
+
+  if("probeset" %in% colnames(plot_data)) g <- g + facet_grid(~probeset)
+  
+  print(g)
+  
+  # make a new line
+  cat('\n')
+  cat('\n')
+}
+
+```
+
+
+
+
+# eQTL
+
+```{r eQTL Open DB eQTL Tables}
+
+# Open the eQTL Tables for the Intersections
+#----------------------------------------------------------------------------------------------------------------------
+
+# sql filter to order by the pvalue
+sql_filter <- "order by pvalue"
+
+# pre-processing function for eQTL
+eQTL_preprocess <- function(y){
+  
+  # grab the gene name & location, snp name & location and pvalue
+  tbl_diet_tissue <- llply(y, function(x) dplyr::select(x, matches("gene"), rsID, matches("snp"), pvalue, -snp_weight, -snp_odds_ratio))
+  
+  tbl_diet_tissue <- llply(1:length(tbl_diet_tissue), function(i){
+    # grab names (remove the allinfo and the body tissue)
+    kind <- names(tbl_diet_tissue)[i] %>% 
+      str_extract_all("Chow|HighFat|Male|Female") %>% 
+      laply(function(x) paste(x, collapse = ""))
+    
+    # add kind to data frames
+    r <- mutate(tbl_diet_tissue[[i]], kind = kind)
+    
+    # return
+    return(r)
+  })
+
+  # only use data where the pvalues are less than 1e-05 (multiple corrections)
+  tbl_diet_tissue <- llply(tbl_diet_tissue, function(x) subset(x, pvalue < 1e-05))
+  
+  # reformat the names (remove "AllInfo")
+  names(tbl_diet_tissue) <- str_replace(names(tbl_diet_tissue), "AllInfo", "")
+
+  # return after done preprocessing
+  return(tbl_diet_tissue)
+  
+}
+
+# open the correlation tables
+all_eQTL <- open_db(eQTL_tables_of_interest, sql_filter = sql_filter, process_func = eQTL_preprocess)
+
+```
+
+```{r eQTL Combine within Tissues}
+
+# Combine the tables
+#----------------------------------------------------------------------------------------------------------------------
+
+# combine the data from the tissues
+all_eQTL$combined_eQTL <- with(all_eQTL, llply(all_tables, rbindlist))
+
+```
+
+## Within Tissue Plots
+```{r eQTL Output Plots of eQTL, results = 'asis', message = FALSE, fig.height = 8, fig.width = 8}
+
+# Hard Code in Data Regarding Chromosome Absolute BP Locations from UCSC Genome Browser mm10
+#----------------------------------------------------------------------------------------------------------------------
+
+# abs bp length for each chromosome
+bp <- c(195471971, 182113224, 160039680, 156508116, 151834684, 149736546, 145441459, 129401213, 124595110, 130694993, 122082543, 120129022, 120421639, 124902244, 104043685, 98207768, 94987271, 90702639, 61431566)
+
+# add the chromosome ranges to a data frame
+chr_cutoffs <- data.frame(chr = as.numeric(1:19), bp_end = bp, abs_bp_end = cumsum(bp))
+chr_cutoffs$abs_bp_start <- c(1, chr_cutoffs$abs_bp_end + 1)[1:nrow(chr_cutoffs)]
+chr_cutoffs <- dplyr::select(chr_cutoffs, chr, abs_bp_start, abs_bp_end)
+chr_cutoffs <- mutate(chr_cutoffs, abs_bp_midpoint = (abs_bp_end - abs_bp_start)/2 + abs_bp_start)
+
+
+# Plot the Histogram of Significant SNPs
+#----------------------------------------------------------------------------------------------------------------------
+
+# function to replace na with 0
+replace_na <- function(x) ifelse(is.na(x), 0, x)
+
+# For each tissue, plot out the histogram of significant snps
+for(i in 1:nrow(all_eQTL)){
+  
+  # print the tissue name
+  cat('### ', all_eQTL$tissue[i])
+  cat('\n')
+  
+  
+  # plot the data
+  plot_data <- all_eQTL$combined_eQTL[[i]]
+  
+  if(nrow(plot_data) > 0){
+    
+    g <- ggplot() +
+      # add the histograms of our data
+      geom_histogram(data = plot_data, aes(x = snp_bp_abs), fill = "navyblue", alpha = 0.8) +
+      # separate plots for chow v highfat
+      facet_grid(kind ~ .) + 
+      # adjust the x-axis to cover entire genome
+      xlim(1, chr_cutoffs$abs_bp_end[19])
+  
+    # find the max y range to go to
+    ymax <- ggplot_build(g)$panel$ranges[[1]]$y.range[2]
+    
+    g <- g +
+      # annotate the chromosome # in the background
+      geom_rect(data = chr_cutoffs, aes(xmin = abs_bp_start, xmax = abs_bp_end, ymin = 0, ymax = ymax * 10/8, fill = chr), color = "black", alpha = 0.2) + 
+      # add annotations for our gene of interest
+      geom_vline(xintercept = unique(plot_data$gene_start_abs), linetype = 2) + 
+      geom_vline(xintercept = unique(plot_data$gene_end_abs), linetype = 2) +
+      # add the chromosome gene number to sliver
+      geom_text(data = chr_cutoffs, aes(x = abs_bp_midpoint, label = chr), y = ymax * 10/9) +
+      # plot formatting
+      xlab("Absolute BP") + 
+      theme(legend.position = "none") +
+      ggtitle(paste0("Correlated SNPs for ", all_eQTL$tissue[i]))
+    
+    print(g)
+    
+    # make a new line
+    cat('\n')
+    cat('\n')
+    
+    # print a corresponding table for the plot
+    plot_data %>% 
+      # summarise the number of snps in each chromosome
+      group_by(kind, gene_chr, snp_chr) %>% 
+      dplyr::summarise(number_of_SNPs = n()) %>% 
+      # formatting options for print table
+      mutate(snp = as.character(snp_chr), snp = paste0("Chr ", ifelse(nchar(snp) == 1, paste0("0", snp), snp))) %>% 
+      dcast(kind ~ snp, value.var = "number_of_SNPs") %>% 
+      mutate_each(funs(replace_na(.))) %>% 
+      # print results
+      kable(format = "markdown") %>% print
+    
+  }
+  
+  # make a new line
+  cat('\n')
+  cat('\n')
+  
+}  
+
+```
+
+## Low Dimensional Table View of SNPs 
+```{r eQTL Low Dimensional Table of SNPs, results = 'asis'}
+
+# Functions classify a snp relative to the gene of interest
+  # Parameters: 
+    # snp_loci, vector of snp locations
+    # gene_start, gene_end, vector of the start and end bp/locations of the gene
+  # Returns: a matrix of whether snp is inside/upstream/downstream of gene and the relative location in abs bp
+
+classify_snp <- function(snp_loci, gene_start, gene_end){
+  if(between(snp_loci, gene_start, gene_end)) c("inside", 0) # within the gene
+  else if(snp_loci < gene_start) c("upstream", gene_start - snp_loci) # before the gene
+  else c("downstream", snp_loci - gene_end) # after the gene
+}
+v_classify_snp <- Vectorize(classify_snp)
+
+
+# Functions to run formatting
+low_dimension_eQTL <- function(x){
+  # compute classification and location
+  locations <- with(x, v_classify_snp(snp_bp_abs, gene_start_abs, gene_end_abs))
+  
+  sub_eQTL_locations <- x %>% 
+    mutate(
+      # add classifications and relative locations to the data
+      side_rel_to_gene = locations[1,],
+      rel_location = as.numeric(locations[2,]),
+      # compute relative locations (so we can group nearbsub_eQTL_locations snps together)
+      std_rel_location = floor(rel_location / 1e06),
+      std_rel_location = ifelse(side_rel_to_gene == "inside_rel_to_gene", std_rel_location, std_rel_location + 1)
+    )
+  
+  # within each group find the median snp and the number of snps in the group
+  median_location <- sub_eQTL_locations %>% 
+    group_by(kind, snp_chr, side_rel_to_gene, std_rel_location) %>% 
+    dplyr::summarise(
+      median = median(snp_bp_abs), 
+      n_other_snp_nearby = n() - 1
+    )
+  
+  # combine grouped data with original data 
+  sub_eQTL_locations_merged <- merge(sub_eQTL_locations, median_location, c("kind", "snp_chr", "side_rel_to_gene", "std_rel_location"), all = TRUE)
+  
+  # convert the snp_chr variable to a numeric value so it can be sorted
+  sub_eQTL_locations_merged$snp_chr <- as.numeric(as.character(sub_eQTL_locations_merged$snp_chr))
+  
+  eQTL_low_dimension <- sub_eQTL_locations_merged %>% 
+    # subset to only the median snp within the group to provide low-dimensional view
+    subset(median == snp_bp_abs) %>% 
+    # formatting for table
+    arrange(kind, snp_chr, std_rel_location) %>% 
+    dplyr::select(kind, rsID, snp_chr, snp_bp_abs, n_other_snp_nearby)
+  
+  # rename for table formatting
+  colnames(eQTL_low_dimension) <- c("diet", "rsID", "snp_chr", "snp_bp_abs", "number_of_other_snps_nearby")
+  
+  # return results
+  return(eQTL_low_dimension)
+}
+
+
+
+# Run formatting and print out tables
+for(i in 1:nrow(all_eQTL)){
+  
+  # print the tissue name
+  cat('### ', all_eQTL$tissue[i])
+  cat('\n')
+  
+  if( nrow(all_eQTL$combined_eQTL[[i]]) > 0 ){
+    eQTL_low_dimension <- low_dimension_eQTL(all_eQTL$combined_eQTL[[i]])
+
+    # print results
+    eQTL_low_dimension %>% kable(format = "markdown") %>% print
+  }
+
+  # make a new line
+  cat('\n')
+  cat('\n')
+}
+
+```

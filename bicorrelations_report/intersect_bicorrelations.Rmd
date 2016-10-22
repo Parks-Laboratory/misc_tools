@@ -1,0 +1,305 @@
+---
+title: "Gene Query: `r params$gene_symbol`"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: pdf_document
+params:
+  database: x
+  table_prefix: all_bicorrelations
+  gene_symbol: x
+  select_top: 1000
+---
+
+```{r, echo = FALSE}
+# Markdown Report to Query Experimental Details from Lab Database
+# Date: June 10 2016
+# Author: Jenny Nguyen
+# Email: jnnguyen2@wisc.edu
+
+# Markdown Report to Query Experimental Details from Lab Database
+
+# Function:
+# 1) Correlations: intersects top genes that are highly correlated (bicorrelation) to gene of interest across genders and diet within a tissue set
+
+
+# Parameters:
+  # database: (string) name of the database to query data from
+  # table_prefix: (string) the prefix of the tables to extract data from (refer to database); tables should have the column names gene_symbol1, gene_symbol2, bicor, pvalue
+  # gene_name: (string) gene of interest
+  # select_top: (integer) select top n genes that are highly correlated to gene of interest (ranked by pvalue); top genes from intersected for each tissue group
+
+# Returns: PDF report
+```
+
+```{r setup, echo = FALSE, message = FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(stringr)
+library(dplyr)
+library(data.table)
+library(RODBC)
+library(knitr)
+library(pander)
+
+present_col <- 7
+```
+
+# Correlation Intersects: Top `r params$select_top` Records 
+
+```{r extract data from database}
+# Connect to Database
+#----------------------------------------------------------------------------------------------------------------------
+db <- odbcDriverConnect( paste0('SERVER=PARKSLAB;DATABASE=', params$database,';Trusted_Connection=Yes;DRIVER={SQL Server}') )
+
+# Extract Data
+#----------------------------------------------------------------------------------------------------------------------
+
+# Search sql database for all the table names
+data_sources <- sqlTables(db) %>% 
+  dplyr::select(TABLE_CAT, TABLE_SCHEM, TABLE_NAME) %>% 
+  subset(str_detect(TABLE_NAME, params$table_prefix)) %>% 
+  dplyr::mutate(
+    tissue = str_extract(TABLE_NAME, "liver|adipose"),
+    gender = str_extract(TABLE_NAME, "male|female"), 
+    is_reactive = str_detect(TABLE_NAME, "reactive")
+  ) 
+
+# function for open each section
+open <- function(x){
+  # query
+  generic_query <- paste0("select top ", params$select_top, 
+                          " gene_symbol1 as gene_symbol, gene_symbol2 as correlated_with, bicor, pvalue ", 
+                          "from ", x$TABLE_SCHEM, ".", x$TABLE_NAME, "\n",
+                          "where gene_symbol1 = \'", params$gene_symbol, "\' order by pvalue"
+  )
+  
+  # inner loop to open query db for the specified tissue tables
+  tbl_diet_tissue <- lapply(generic_query, function(q) sqlQuery(db, q))
+  names(tbl_diet_tissue) <- lapply(str_extract_all(x$TABLE_NAME, "chow|highfat|HF|reactive|male|female"), paste, collapse = "_")
+  
+  # return the sql query results
+  return(tbl_diet_tissue)
+}
+
+# open tables as a grouped data frame
+all_correlations <- data_sources %>% 
+  group_by(tissue) %>% 
+  do(all_tables = open(.))
+
+
+# Close Database Connection
+#----------------------------------------------------------------------------------------------------------------------
+odbcClose(db) 
+```
+
+
+```{r perform intersections}
+# Intersections by Tissue
+#----------------------------------------------------------------------------------------------------------------------
+
+# Function to find intersections between all highly correlated genes with the given gene
+# Parameters: tissue_set, a list of data frames corresponding to one tissue
+# Returns: a data frame, where all the variants (chow, highfat, etc) are merged together
+
+intersect_mouse <- function(tissue_set, remove_reactive){
+  
+  if(remove_reactive) tissue_set[["reactive_male"]] <- NULL
+
+  # find intersections/(3way inner merges) between all highly correlated genes with given gene
+  set_intersect <- lapply(tissue_set, function(x) distinct(dplyr::select(x, gene_symbol, correlated_with, bicor)))
+  intersect_and_bicor <- Reduce(function(x, y) merge(x, y, by = c("gene_symbol", "correlated_with")), set_intersect)
+  
+  # obtain bicor information from the intersections, rename so that bicor info also contains tissue set info
+  colnames(intersect_and_bicor)[3:ncol(intersect_and_bicor)] <- paste0("bicor_", names(tissue_set) )
+
+  # remove NULL values
+  intersect_ms <- subset(intersect_and_bicor, correlated_with != "NULL")
+  
+  # return intersection results
+  return(intersect_ms)
+}
+
+# Functions to obtain intersection tables
+# Parameters: x, a list of tissue data frames with column names gene_symbol, correlated_with, bicor_("additional descriptor")
+# Returns: list of tissue objects formatted for the specific presentation purpose
+
+# function to present intersections
+find_intersections <- function(x){
+  
+  # extract names of the correlated genes
+  return_obj <- lapply(x, function(set_intersect){
+    
+    # convert the top genes into a matrix format for condensed printing 
+    set_intersect <- unique(as.character(set_intersect$correlated_with))
+    how_many_spaces <- present_col - (length(set_intersect) %% present_col)
+    set_intersect <- matrix(c(set_intersect, rep("", how_many_spaces)), byrow = TRUE, ncol = present_col)
+    
+    # return intersection
+    return(set_intersect)
+    
+  })
+  
+  # return results
+  return(return_obj)
+}
+
+# function to present intersections with bicor
+find_intersections_with_bicor <- function(x) {
+  
+  # extract intersections along with bicor information for x
+  return_obj <- lapply(x, function(intersect_and_bicor){
+    
+    # remove the gene symbol column
+    intersect_and_bicor <- dplyr::select(intersect_and_bicor, correlated_with, matches("bicor"))
+    
+    # function to reformat the merged data
+    edit_repeats <- function(y){
+      
+      # find the unique bicorrelations
+      unique_vals <- lapply( 2:ncol(y), function(col) unique(unlist(y[, col])) )
+      names(unique_vals) <- colnames(y)[2:ncol(y)]
+      
+      # find the number of rows we need to fill
+      num_rep <- max( plyr::laply(unique_vals, length) )
+      
+      # for those who do not fall within the number of rows, add NA to end
+      new_data <- lapply(unique_vals, function(col) c(col, rep(NA, num_rep - length(col))) )
+      
+      # add in the object correlated with
+      new_data[["correlated_with"]] <- unique(y$correlated_with)
+      
+      # make it into a data frame
+      new_data <- as.data.frame(new_data, stringsAsFactors = FALSE)
+      new_data <- dplyr::select(new_data, correlated_with, everything())
+      
+      # return 
+      return(new_data)
+    }
+    
+    # reformat the merged data (avoid duplicating the values due to the merge)
+    intersect_and_bicor <- intersect_and_bicor %>% 
+      group_by(correlated_with) %>% 
+      do(edit_repeats(.))
+    
+    return(intersect_and_bicor)
+  })
+  
+  # return results
+  return(return_obj)
+}
+
+
+# Intersections by Tissue for Mouse Strains
+#----------------------------------------------------------------------------------------------------------------------
+
+# find intersections in mouse by tissue
+all_correlations$intersections_by_tissue_mouse_no_reactive <- with(all_correlations, lapply(all_tables, intersect_mouse, remove_reactive = TRUE))
+all_correlations$intersections_by_tissue_mouse_reactive <- with(all_correlations, lapply(all_tables, intersect_mouse, remove_reactive = FALSE))
+
+# obtain the intersections 
+all_correlations <- all_correlations %>% 
+  group_by(tissue) %>% 
+  mutate(
+    set_intersect_by_tissue_no_reactive = find_intersections(intersections_by_tissue_mouse_no_reactive),
+    set_intersect_with_bicor_no_reactive = find_intersections_with_bicor(intersections_by_tissue_mouse_no_reactive),
+    set_intersect_by_tissue_reactive = find_intersections(intersections_by_tissue_mouse_reactive),
+    set_intersect_with_bicor_reactive = find_intersections_with_bicor(intersections_by_tissue_mouse_reactive)
+  )
+```
+
+## Within Tissue Intersections Without Reactive Data
+
+```{r print tissue intersects, results = 'asis'}
+# Output the tissue interaction tables
+#----------------------------------------------------------------------------------------------------------------------
+
+# Loop to print out the intersections within a tissue
+for(i in 1:nrow(all_correlations)){
+  
+  # print the tissue name
+  cat('### ', all_correlations$tissue[i])
+  cat('\n')
+  
+  # print the table
+  all_correlations$set_intersect_by_tissue_no_reactive[[i]] %>% pandoc.table(split.tables = Inf) 
+  
+  # make a new line
+  cat('\n')
+}
+```
+
+## Within Tissue Intersections with Bicorrelations Without Reactive Data
+
+```{r print tissue intersects with bicor, results = 'asis'}
+# Output tissues intersections with bicor information
+#----------------------------------------------------------------------------------------------------------------------
+
+# Loop to print out the intersections within a tissue
+for(i in 1:nrow(all_correlations)){
+  
+  # print the tissue name
+  cat('### ', all_correlations$tissue[i])
+  cat('\n')
+  
+  # print the table
+  all_correlations$set_intersect_with_bicor_no_reactive[[i]] %>% pandoc.table(split.tables = Inf) 
+  
+  # make a new line
+  cat('\n')
+}
+```
+
+
+```{r print tissue intersects 2, results = 'asis'}
+# Output the tissue interaction tables
+#----------------------------------------------------------------------------------------------------------------------
+
+if(params$database == "HMDP"){
+  
+  cat("## Within Tissue Intersections With Reactive Data")
+  cat('\n')
+
+  # Loop to print out the intersections within a tissue
+  for(i in 1:nrow(all_correlations)){
+    
+    # print the tissue name
+    cat('### ', all_correlations$tissue[i])
+    cat('\n')
+    
+    # print the table
+    all_correlations$set_intersect_by_tissue_reactive[[i]] %>% pandoc.table(split.tables = Inf) 
+    
+    # make a new line
+    cat('\n')
+  }
+}
+
+```
+
+
+```{r print tissue intersects with bicor 2, results = 'asis'}
+# Output tissues intersections with bicor information
+#----------------------------------------------------------------------------------------------------------------------
+
+if(params$database == "HMDP"){
+  
+  cat("## Within Tissue Intersections with Bicorrelations With Reactive Data")
+  cat('\n')
+  
+  # Loop to print out the intersections within a tissue
+  for(i in 1:nrow(all_correlations)){
+    
+    # print the tissue name
+    cat('### ', all_correlations$tissue[i])
+    cat('\n')
+    
+    # print the table
+    all_correlations$set_intersect_with_bicor_reactive[[i]] %>% pandoc.table(split.cells = 20, split.tables = Inf) 
+    
+    # make a new line
+    cat('\n')
+  }
+}
+
+```
+
+
